@@ -1,12 +1,13 @@
-# Nimiq Core implementation in Rust _(core-rs)_
+# Nimiq Core implementation of Albatross in Rust _(core-rs)_
 
 ![nimiq](docs/nimiq_logo_rgb_horizontal.png)
 
-> Rust implementation of the Nimiq Blockchain Core
+> Rust implementation of the Nimiq Blockchain Albatross Core
 
 **[Nimiq](https://nimiq.com/)**  is a frictionless payment protocol for the web.
 
 This repository is **Work in Progress** and is currently in beta-testing phase. If you need a reliable client implementation to run in a production environment, please use the [JavaScript implementation](https://github.com/nimiq/core-js/) instead. Only use this if you can tolerate bugs and want to help with beta-testing the Nimiq Rust implementation.
+If you are looking for the current Rust implementation of Nimiq, check our [repository here](https://github.com/nimiq/core-rs).
 
 The Nimiq Rust client comes without wallet and can currently not be used to send transactions. As a back-bone node it is more performant than the JavaScript implementation though.
 
