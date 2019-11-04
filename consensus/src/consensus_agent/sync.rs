@@ -1,6 +1,7 @@
 use std::collections::vec_deque::VecDeque;
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
@@ -16,10 +17,12 @@ use network_messages::{EpochTransactionsMessage, GetBlocksDirection, GetBlocksMe
 use primitives::policy;
 use transaction::Transaction;
 use utils::merkle::compute_root_from_content;
-use utils::observer::{PassThroughListener, PassThroughNotifier};
+use utils::mutable_once::MutableOnce;
+use utils::observer::{PassThroughListener, PassThroughNotifier, weak_listener};
+use utils::timers::Timers;
 
 pub trait SyncProtocol<'env, B: AbstractBlockchain<'env>>: Send + Sync {
-    fn new(blockchain: Arc<B>, peer: Arc<Peer>) -> Self;
+    fn new(blockchain: Arc<B>, peer: Arc<Peer>) -> Arc<Self>;
     fn initiate_sync(&self) {}
     fn get_block_locators(&self, max_count: usize) -> Vec<Blake2bHash>;
     fn request_blocks(&self, locators: Vec<Blake2bHash>, max_results: u16);
@@ -43,12 +46,12 @@ pub struct FullSync<'env, B: AbstractBlockchain<'env>> {
 }
 
 impl<'env, B: AbstractBlockchain<'env>> SyncProtocol<'env, B> for FullSync<'env, B> {
-    fn new(blockchain: Arc<B>, peer: Arc<Peer>) -> Self {
-        Self {
+    fn new(blockchain: Arc<B>, peer: Arc<Peer>) -> Arc<Self> {
+        Arc::new(Self {
             blockchain,
             peer,
             notifier: RwLock::new(PassThroughNotifier::new()),
-        }
+        })
     }
 
     fn get_block_locators(&self, max_count: usize) -> Vec<Blake2bHash> {
@@ -97,7 +100,8 @@ struct MacroBlockSyncState {
     transactions_cache: Vec<Transaction>,
     /// The current state of the syncing.
     state: MacroBlockSyncingState,
-
+    /// Boolean flag whether we are currently processing an epoch.
+    processing_epoch: bool,
 }
 
 impl MacroBlockSyncState {
@@ -106,8 +110,14 @@ impl MacroBlockSyncState {
             block_cache: VecDeque::new(),
             transactions_cache: Vec::new(),
             state: MacroBlockSyncingState::Finished,
+            processing_epoch: false,
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum MacroBlockSyncTimer {
+    EpochTransactions(u32)
 }
 
 pub struct MacroBlockSync<'env> {
@@ -115,24 +125,75 @@ pub struct MacroBlockSync<'env> {
     state: RwLock<MacroBlockSyncState>,
     peer: Arc<Peer>,
     notifier: RwLock<PassThroughNotifier<'static, SyncEvent<AlbatrossBlockError>>>,
+    timers: Timers<MacroBlockSyncTimer>,
+    self_weak: MutableOnce<Weak<MacroBlockSync<'env>>>,
 }
 
-impl<'env> MacroBlockSync<'env> {
+impl MacroBlockSync<'static> {
+    /// Maximum time to wait after sending out get-data or receiving the last object for this request.
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
     fn complete_epoch(&self, block: AlbatrossBlock, transactions: &[Transaction]) {
+        self.state.write().processing_epoch = false;
+
         let hash = block.hash();
         let result = self.blockchain.push_isolated_macro_block(block, transactions);
         self.notifier.read().notify(SyncEvent::BlockProcessed(hash, result));
+
+        self.start_processing();
+    }
+
+    fn start_processing(&self) {
+        let mut state = self.state.write();
+
+        if !state.processing_epoch && !state.block_cache.is_empty() {
+            state.processing_epoch = true;
+            let block = state.block_cache.front().unwrap();
+            let epoch = policy::epoch_at(block.block_number());
+
+            // Set timeout.
+            let weak = self.self_weak.clone();
+            self.timers.set_delay(MacroBlockSyncTimer::EpochTransactions(epoch), move || {
+                let this = upgrade_weak!(weak);
+                // TODO: What should happen if we don't receive any response?
+                // For now, just drop the connection with that peer.
+                this.peer.channel.close(CloseType::GetEpochTransactionsTimeout);
+            }, Self::REQUEST_TIMEOUT);
+
+            self.peer.channel.send_or_close(GetEpochTransactionsMessage::new(epoch));
+        }
+    }
+
+    fn on_close(&self) {
+        self.timers.clear_all();
     }
 }
 
-impl<'env> SyncProtocol<'env, AlbatrossBlockchain<'env>> for MacroBlockSync<'env> {
-    fn new(blockchain: Arc<AlbatrossBlockchain<'env>>, peer: Arc<Peer>) -> Self {
-        Self {
+impl SyncProtocol<'static, AlbatrossBlockchain<'static>> for MacroBlockSync<'static> {
+    fn new(blockchain: Arc<AlbatrossBlockchain<'static>>, peer: Arc<Peer>) -> Arc<Self> {
+        let this = Arc::new(Self {
             peer,
             blockchain,
             state: RwLock::new(MacroBlockSyncState::new()),
             notifier: RwLock::new(PassThroughNotifier::new()),
+            timers: Timers::new(),
+            self_weak: MutableOnce::new(Weak::new()),
+        });
+
+        // Update the self weak reference.
+        unsafe {
+            let weak = Arc::downgrade(&this);
+            this.self_weak.replace(weak);
         }
+
+        {
+            let mut close_notifier = this.peer.channel.close_notifier.write();
+            close_notifier.register(weak_listener(
+                Arc::downgrade(&this),
+                |this, _| this.on_close()));
+        }
+
+        this
     }
 
     fn initiate_sync(&self) {
@@ -169,8 +230,8 @@ impl<'env> SyncProtocol<'env, AlbatrossBlockchain<'env>> for MacroBlockSync<'env
             MacroBlockSyncingState::MacroBlocks => {
                 // Cache block and request transactions.
                 state.block_cache.push_back(block);
-                // TODO: Handle timeout.
-                self.peer.channel.send_or_close(GetEpochTransactionsMessage::new(hash));
+                drop(state);
+                self.start_processing();
             },
             _ => {
                 let result = self.blockchain.push(block);
@@ -182,7 +243,7 @@ impl<'env> SyncProtocol<'env, AlbatrossBlockchain<'env>> for MacroBlockSync<'env
     fn on_epoch_transactions(&self, epoch_transactions: EpochTransactionsMessage) {
         // Validate proof to prevent the peer from spamming us with transactions.
         let proof = epoch_transactions.tx_proof.proof;
-        let transactions = epoch_transactions.tx_proof.transactions;
+        let mut transactions = epoch_transactions.tx_proof.transactions;
 
         let state = self.state.upgradable_read();
 
@@ -216,11 +277,12 @@ impl<'env> SyncProtocol<'env, AlbatrossBlockchain<'env>> for MacroBlockSync<'env
                 }
 
                 // Append transactions
-                for tx in transactions {
-                    state.transactions_cache.push(tx);
-                }
+                // TODO: Make sure that transactions are in right order by checking whether the proofs match.
+                state.transactions_cache.append(&mut transactions);
 
                 if epoch_transactions.last {
+                    self.timers.clear_delay(&MacroBlockSyncTimer::EpochTransactions(epoch_transactions.epoch));
+
                     let transactions = mem::replace(&mut state.transactions_cache, Vec::new());
                     // Check full root
                     let full_root: Blake2bHash = compute_root_from_content::<Blake2bHasher, _>(&transactions);
@@ -235,9 +297,18 @@ impl<'env> SyncProtocol<'env, AlbatrossBlockchain<'env>> for MacroBlockSync<'env
 
                     drop(state);
                     self.complete_epoch(block, &transactions);
+                } else {
+                    // Reset delay to allow for more time.
+                    let weak = self.self_weak.clone();
+                    self.timers.reset_delay(MacroBlockSyncTimer::EpochTransactions(epoch_transactions.epoch), move || {
+                        let this = upgrade_weak!(weak);
+                        // TODO: What should happen if we don't receive any response?
+                        // For now, just drop the connection with that peer.
+                        this.peer.channel.close(CloseType::GetEpochTransactionsTimeout);
+                    }, Self::REQUEST_TIMEOUT);
                 }
             },
-            Err(e) => {
+            Err(_e) => {
                 warn!("We received an invalid merkle proof from {} - discarding and closing the channel", self.peer.peer_address());
                 self.peer.channel.close(CloseType::InvalidEpochTransactions);
                 return;
